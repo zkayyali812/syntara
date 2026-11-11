@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Annotated
 
+import structlog
 from execution_plane_client.catalog import CommandCatalog
 from execution_plane_client.commands.results import TransportReceipt
 from execution_plane_client.errors import ProtocolConflict, UnsupportedCommand
@@ -19,6 +20,7 @@ from syntara.execution_plane.client import EP_AUDIENCE, EP_CLIENT_ID
 from syntara.execution_plane.commands.context import AOCommandContext
 from syntara.execution_plane.commands.errors import CommandDependencyUnavailableError, CommandResourceNotFoundError
 from syntara.execution_plane.commands.registry import build_ao_registry
+from syntara.execution_plane.spiffe_auth import authenticate_callback
 from syntara.workflows.executions_router import get_temporal_execution_service
 from syntara.workflows.workflow_engine.services.temporal_execution_service import (
     TemporalExecutionService,  # noqa: TC001 — FastAPI resolves dependency annotations
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 router = SyntaraRouter(prefix="/api/execution_plane/v1", tags=["Execution Plane"])
 catalog = CommandCatalog()
 registry = build_ao_registry()
+logger = structlog.stdlib.get_logger(__name__)
 
 
 @router.post(
@@ -47,9 +50,16 @@ async def receive_execution_plane_command(
 ) -> TransportReceipt:
     """Authenticate one command, dispatch it through the registry, and return its result."""
     settings = get_settings()
+    if settings.ep_spiffe_id or settings.ep_spiffe_jwt_bundle_path:
+        authenticate_callback(request, settings)
+        authenticated = True
+    else:
+        authenticated = (
+            getattr(request.state, "is_cert_authenticated", False)
+            and getattr(request.state, "cert_cn", None) == settings.ep_callback_service_cn
+        )
     if (
-        not getattr(request.state, "is_cert_authenticated", False)
-        or getattr(request.state, "cert_cn", None) != settings.ep_callback_service_cn
+        not authenticated
         or message.source_id != EP_AUDIENCE
         or message.destination_id != EP_CLIENT_ID
         or message.scope.client_id != EP_CLIENT_ID
@@ -58,6 +68,14 @@ async def receive_execution_plane_command(
     try:
         payload = catalog.validate(message)
         handler = registry.get(message.command.command_type, message.command.command_revision)
+        if getattr(request.state, "ep_spiffe_id", None):
+            logger.info(
+                "EP SPIFFE command authenticated",
+                spiffe_id=request.state.ep_spiffe_id,
+                principal_id=str(request.state.ep_principal_id),
+                command_type=message.command.command_type,
+                message_id=str(message.message_id),
+            )
         handled = await handler.handle(message, payload, AOCommandContext(session, temporal_service))
     except CommandDependencyUnavailableError:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Temporal is unavailable") from None

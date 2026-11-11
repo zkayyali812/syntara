@@ -1844,6 +1844,10 @@ class WorkflowClientSettings(BaseSettings):
         description="mTLS service identity permitted to deliver EP completion events.",
     )
 
+    ep_spiffe_id: str | None = None
+    ep_spiffe_jwt_bundle_path: str | None = None
+    ep_spiffe_jwt_audience: str = "syntara-ep-callback"
+
     @model_validator(mode="after")
     def validate_backoff_relationship(self) -> "WorkflowClientSettings":
         """Validate that max_backoff >= initial_backoff.
